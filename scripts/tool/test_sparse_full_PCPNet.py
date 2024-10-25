@@ -23,6 +23,8 @@ from util.MSECNet import PointcloudPatchDataset, RandomPointcloudPatchSampler, S
 from util import transform as t
 from util.data_util import collate_fn
 
+from scipy.spatial import cKDTree
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -156,6 +158,61 @@ def prepare_input(xyz, feat):
     xyz = xyz / max_dist 
     return xyz, feat
 
+
+def soft_farthest_sampling_kdtree(coord_part, feat_part, idx_part, args, pca):
+    # Initialize variables
+    coord_p = np.zeros(coord_part.shape[0], dtype=np.float32)
+    idx_uni = np.array([], dtype=int)
+
+    # Precompute KD-Tree for fast distance lookup
+    kdtree = cKDTree(coord_part)
+
+    # Allocate lists for results
+    idx_list, coord_list, feat_list, offset_list, trans_list = [], [], [], [], []
+
+    # Precompute the number of points to update in each iteration
+    update_count = int(args.points_per_patch * 0.7)
+
+    while idx_uni.size != idx_part.shape[0]:
+        # Choose the initial index with the smallest value in coord_p
+        init_idx = np.argmin(coord_p)
+
+        # Fast distance computation using KD-Tree
+        _, idx_crop = kdtree.query(coord_part[init_idx], k=args.points_per_patch)
+
+        # Select subset of points
+        coord_sub, feat_sub, idx_sub = coord_part[idx_crop], feat_part[idx_crop], idx_part[idx_crop]
+        coord_sub, feat_sub = prepare_input(coord_sub, feat_sub)
+
+        # Apply optional PCA transformation
+        if args.use_pca:
+            coord_sub, _, _, trans_sub = pca(coord_sub, np.random.rand(coord_sub.shape[0], 3), None)
+        else:
+            trans_sub = np.eye(3, 3, dtype=np.float32)
+
+        # Store results
+        idx_list.append(idx_sub)
+        coord_list.append(coord_sub)
+        feat_list.append(feat_sub)
+        offset_list.append(idx_sub.size)
+        trans_list.append(trans_sub)
+
+        # Update the set of unique indices
+        idx_uni = np.unique(np.concatenate((idx_uni, idx_sub)))
+
+        # Update only a subset of indices (for farthest distance sampling)
+        idx_update = idx_crop[:update_count]
+        dist = np.linalg.norm(coord_part[idx_update] - coord_part[init_idx], axis=1)
+
+        # Calculate delta and update coord_p
+        max_dist = np.max(dist)
+        if max_dist > 0:
+            delta = np.square(1 - dist / max_dist)
+            coord_p[idx_update] += delta
+
+    return idx_list, coord_list, feat_list, offset_list, trans_list
+
+
 def test(model, criterion, pred_dim, output_target_ind, output_pred_ind, output_loss_weight):
     logger.info('>>>>>>>>>>>>>>>> Start Full Shape Prediction >>>>>>>>>>>>>>>>')
     model.eval()
@@ -164,7 +221,7 @@ def test(model, criterion, pred_dim, output_target_ind, output_pred_ind, output_
     args.save_folder = os.path.join(args.save_folder, args.data_name)
 
     check_makedirs(args.save_folder)
-    
+
     # get all shape names in the dataset
     data_list = []
     with open(os.path.join(args.indir, 'list', 'testset_all.txt')) as f:
@@ -196,27 +253,16 @@ def test(model, criterion, pred_dim, output_target_ind, output_pred_ind, output_
                 logger.info('{}/{}: {}/{}/{}, {}'.format(idx + 1, len(data_list), i + 1, idx_size, idx_data[0].shape[0], item))
                 idx_part = idx_data[i]
                 coord_part, feat_part = coord[idx_part], feat[idx_part]
-                coord_p, idx_uni, cnt = np.random.rand(coord_part.shape[0]) * 1e-3, np.array([]), 0 # containers for potential based predictions 
-                # generating batches
-                while idx_uni.size != idx_part.shape[0]: # looks like a soft farthest cropping. Must cover all index (points). 
-                    init_idx = np.argmin(coord_p) # random sampling. just choose the smallest index  
-                    dist = np.sum(np.power(coord_part - coord_part[init_idx], 2), 1) # squared dist of all points to selected point 
-                    idx_crop = np.argsort(dist)[:args.points_per_patch] # take kNN using the query point as a center. 
-                    coord_sub, feat_sub, idx_sub = coord_part[idx_crop], feat_part[idx_crop], idx_part[idx_crop]
-                    coord_sub, feat_sub = prepare_input(coord_sub, feat_sub)
-                    if args.use_pca:
-                        coord_sub, _, _, trans_sub = pca(coord_sub, np.random.rand(coord_sub.shape[0], 3), None) 
-                    else:
-                        trans_sub = np.eye(3,3).astype(np.float32)
-                    idx_list.append(idx_sub), coord_list.append(coord_sub), feat_list.append(feat_sub), offset_list.append(idx_sub.size), trans_list.append(trans_sub)
-                    idx_uni = np.unique(np.concatenate((idx_uni, idx_sub)))
+                
+                # Optimized patch sampling with KD-Tree
+                start = time.time()
+                idx_list, coord_list, feat_list, offset_list, trans_list = soft_farthest_sampling_kdtree(
+                    coord_part, feat_part, idx_part, args, pca
+                )
+                logger.info("Generating batches took {:.2f} sec for {} points".format(time.time()-start, coord_part.shape[0]))
 
-                    # potential update
-                    idx_update = idx_crop[:int(args.points_per_patch * 0.7)] # do not increment points that are too far from the center. 
-                    # idx_update = idx_crop
-                    dist = dist[idx_update]  
-                    delta = np.square(1 - dist / np.max(dist)) # farther poitns have smaller delta    
-                    coord_p[idx_update] += delta # increment the random index. so that next index will be quite far from this one. 
+                # Further operations like model inference would go here
+
                 
 
             args.batch_size_test = 128 
@@ -400,7 +446,7 @@ def evaluate(normal_gt_path, normal_pred_path, output_dir):
 
         ### get all shape names in the list
         shape_names = []
-        normal_gt_filenames = os.path.join(normal_gt_path, cur_list)
+        normal_gt_filenames = os.path.join(normal_gt_path, 'list', cur_list)
         with open(normal_gt_filenames) as f:
             shape_names = f.readlines()
         shape_names = [x.strip() for x in shape_names]
