@@ -1,5 +1,5 @@
 # MSECNet specific
-scripts/dataset/pclouds
+scripts/dataset
 scripts/results
 exp
 
